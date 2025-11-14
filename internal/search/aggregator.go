@@ -13,12 +13,6 @@ import (
 	"hostaggr/internal/providers"
 )
 
-// Cache defines the interface for caching search results
-type Cache interface {
-	Get(key string) (models.SearchResponse, bool)
-	Set(key string, value models.SearchResponse)
-}
-
 // Aggregator coordinates searches across multiple providers
 type Aggregator struct {
 	providers []providers.Provider
@@ -39,12 +33,25 @@ func (a *Aggregator) Search(ctx context.Context, req models.SearchRequest) (mode
 
 	// Check cache first
 	if a.cache != nil {
-		cacheKey := a.buildCacheKey(req)
-		if cached, hit := (*a.cache).Get(cacheKey); hit {
-			// Update duration and return cached result
-			cached.Stats.DurationMs = time.Since(startTime).Milliseconds()
-			cached.Stats.Cache = "hit"
-			return cached, nil
+		if cachedHotels, hit := a.cache.Get(req); hit {
+			// Build response from cached hotels
+			response := models.SearchResponse{
+				Search: models.SearchInfo{
+					City:    req.City,
+					CheckIn: req.CheckIn,
+					Nights:  req.Nights,
+					Adults:  req.Adults,
+				},
+				Stats: models.Stats{
+					ProvidersTotal:     len(a.providers),
+					ProvidersSucceeded: 0,
+					ProvidersFailed:    0,
+					Cache:              "hit",
+					DurationMs:         time.Since(startTime).Milliseconds(),
+				},
+				Hotels: cachedHotels,
+			}
+			return response, nil
 		}
 	}
 
@@ -87,8 +94,7 @@ func (a *Aggregator) Search(ctx context.Context, req models.SearchRequest) (mode
 
 	// Cache the result
 	if a.cache != nil {
-		cacheKey := a.buildCacheKey(req)
-		(*a.cache).Set(cacheKey, response)
+		a.cache.Set(req, deduplicatedHotels)
 	}
 
 	return response, nil
@@ -174,10 +180,4 @@ func (a *Aggregator) deduplicateHotels(hotels []models.ProviderHotel) []models.H
 	}
 
 	return result
-}
-
-// buildCacheKey creates a unique cache key from the search request
-func (a *Aggregator) buildCacheKey(req models.SearchRequest) string {
-	return strings.ToLower(req.City) + "|" + req.CheckIn + "|" +
-		string(rune(req.Nights)) + "|" + string(rune(req.Adults))
 }
