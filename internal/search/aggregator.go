@@ -2,39 +2,54 @@ package search
 
 import (
 	"context"
+	"fmt"
+	"log/slog"
 	"sort"
 	"strings"
 	"sync"
 	"time"
 
 	"golang.org/x/sync/errgroup"
+	"golang.org/x/sync/singleflight"
 
+	"hostaggr/internal/middleware"
 	"hostaggr/internal/models"
+	"hostaggr/internal/obs"
 	"hostaggr/internal/providers"
 )
 
-// Aggregator coordinates searches across multiple providers
 type Aggregator struct {
-	providers []providers.Provider
-	cache     *Cache
+	providers       []providers.Provider
+	cache           *Cache
+	providerTimeout time.Duration
+	metrics         *obs.Metrics
+	logger          *slog.Logger
+	sf              singleflight.Group
 }
 
-// NewAggregator creates a new Aggregator instance
-func NewAggregator(provs []providers.Provider, cache *Cache) *Aggregator {
+func NewAggregator(provs []providers.Provider, cache *Cache, providerTimeout time.Duration, metrics *obs.Metrics, logger *slog.Logger) *Aggregator {
 	return &Aggregator{
-		providers: provs,
-		cache:     cache,
+		providers:       provs,
+		cache:           cache,
+		providerTimeout: providerTimeout,
+		metrics:         metrics,
+		logger:          logger,
 	}
 }
 
-// Search performs an aggregated search across all providers
 func (a *Aggregator) Search(ctx context.Context, req models.SearchRequest) (models.SearchResponse, error) {
 	startTime := time.Now()
+	requestID := middleware.GetRequestID(ctx)
 
-	// Check cache first
 	if a.cache != nil {
 		if cachedHotels, hit := a.cache.Get(req); hit {
-			// Build response from cached hotels
+			if a.logger != nil {
+				a.logger.Info("cache hit",
+					"request_id", requestID,
+					"city", req.City,
+					"hotel_count", len(cachedHotels),
+				)
+			}
 			response := models.SearchResponse{
 				Search: models.SearchInfo{
 					City:    req.City,
@@ -55,26 +70,48 @@ func (a *Aggregator) Search(ctx context.Context, req models.SearchRequest) (mode
 		}
 	}
 
-	// Query all providers concurrently
-	providerHotels, succeeded, failed := a.queryProviders(ctx, req)
-
-	// Validate hotels
-	validHotels := make([]models.ProviderHotel, 0)
-	for _, hotel := range providerHotels {
-		if a.isValidHotel(hotel, req) {
-			validHotels = append(validHotels, hotel)
-		}
+	if a.logger != nil {
+		a.logger.Info("cache miss",
+			"request_id", requestID,
+			"city", req.City,
+		)
 	}
 
-	// Deduplicate and select best prices
-	deduplicatedHotels := a.deduplicateHotels(validHotels)
+	key := fmt.Sprintf("%s-%s-%d-%d", req.City, req.CheckIn, req.Nights, req.Adults)
 
-	// Sort by price ascending
-	sort.Slice(deduplicatedHotels, func(i, j int) bool {
-		return deduplicatedHotels[i].Price < deduplicatedHotels[j].Price
+	result, err, _ := a.sf.Do(key, func() (interface{}, error) {
+		providerHotels, succeeded, failed := a.queryProviders(ctx, req)
+
+		validHotels := make([]models.ProviderHotel, 0)
+		for _, hotel := range providerHotels {
+			if a.isValidHotel(hotel, req) {
+				validHotels = append(validHotels, hotel)
+			}
+		}
+
+		deduplicatedHotels := a.deduplicateHotels(validHotels)
+
+		sort.Slice(deduplicatedHotels, func(i, j int) bool {
+			return deduplicatedHotels[i].Price < deduplicatedHotels[j].Price
+		})
+
+		if a.cache != nil {
+			a.cache.Set(req, deduplicatedHotels)
+		}
+
+		return searchResult{
+			hotels:    deduplicatedHotels,
+			succeeded: succeeded,
+			failed:    failed,
+		}, nil
 	})
 
-	// Build response
+	if err != nil {
+		return models.SearchResponse{}, err
+	}
+
+	sr := result.(searchResult)
+
 	response := models.SearchResponse{
 		Search: models.SearchInfo{
 			City:    req.City,
@@ -84,28 +121,28 @@ func (a *Aggregator) Search(ctx context.Context, req models.SearchRequest) (mode
 		},
 		Stats: models.Stats{
 			ProvidersTotal:     len(a.providers),
-			ProvidersSucceeded: succeeded,
-			ProvidersFailed:    failed,
+			ProvidersSucceeded: sr.succeeded,
+			ProvidersFailed:    sr.failed,
 			Cache:              "miss",
 			DurationMs:         time.Since(startTime).Milliseconds(),
 		},
-		Hotels: deduplicatedHotels,
-	}
-
-	// Cache the result
-	if a.cache != nil {
-		a.cache.Set(req, deduplicatedHotels)
+		Hotels: sr.hotels,
 	}
 
 	return response, nil
 }
 
-// queryProviders queries all providers concurrently with timeout and error handling
+type searchResult struct {
+	hotels    []models.Hotel
+	succeeded int
+	failed    int
+}
+
 func (a *Aggregator) queryProviders(ctx context.Context, req models.SearchRequest) ([]models.ProviderHotel, int, int) {
-	// Create context with 2-second timeout
-	queryCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
+	queryCtx, cancel := context.WithTimeout(ctx, a.providerTimeout)
 	defer cancel()
 
+	requestID := middleware.GetRequestID(ctx)
 	g, gCtx := errgroup.WithContext(queryCtx)
 
 	var mu sync.Mutex
@@ -116,17 +153,41 @@ func (a *Aggregator) queryProviders(ctx context.Context, req models.SearchReques
 	for _, provider := range a.providers {
 		p := provider
 		g.Go(func() error {
+			providerStart := time.Now()
 			hotels, err := p.Search(gCtx, req)
+			duration := time.Since(providerStart).Milliseconds()
 
 			mu.Lock()
 			defer mu.Unlock()
 
 			if err != nil {
 				failed++
+				if a.metrics != nil {
+					a.metrics.IncrementProviderError(p.Name())
+				}
+				if a.logger != nil {
+					a.logger.Warn("provider query failed",
+						"request_id", requestID,
+						"provider_name", p.Name(),
+						"duration_ms", duration,
+						"error", err.Error(),
+					)
+				}
 				return nil
 			}
 
 			succeeded++
+			if a.metrics != nil {
+				a.metrics.IncrementProviderSuccess(p.Name())
+			}
+			if a.logger != nil {
+				a.logger.Info("provider query succeeded",
+					"request_id", requestID,
+					"provider_name", p.Name(),
+					"duration_ms", duration,
+					"hotel_count", len(hotels),
+				)
+			}
 			allHotels = append(allHotels, hotels...)
 			return nil
 		})
@@ -137,9 +198,7 @@ func (a *Aggregator) queryProviders(ctx context.Context, req models.SearchReques
 	return allHotels, succeeded, failed
 }
 
-// isValidHotel validates a hotel against the search request
 func (a *Aggregator) isValidHotel(h models.ProviderHotel, req models.SearchRequest) bool {
-
 	if h.HotelID == "" || h.Name == "" || h.City == "" || h.Currency == "" {
 		return false
 	}
@@ -155,7 +214,6 @@ func (a *Aggregator) isValidHotel(h models.ProviderHotel, req models.SearchReque
 	return true
 }
 
-// deduplicateHotels removes duplicates by hotel_id, keeping the lowest price
 func (a *Aggregator) deduplicateHotels(hotels []models.ProviderHotel) []models.Hotel {
 	bestPrices := make(map[string]models.Hotel)
 

@@ -1,0 +1,34 @@
+# Compiled binaries
+bin/
+
+# Tests
+tests/
+
+# Documentation
+*.md
+
+# Git files
+.git/
+.gitignore
+
+# Build files
+Makefile
+
+# IDE and editor files
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Docker files (don't need in the image)
+Dockerfile
+.dockerignore
+
+# Environment files
+.env
+.env.local

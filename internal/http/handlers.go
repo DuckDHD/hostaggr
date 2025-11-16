@@ -3,24 +3,31 @@ package http
 import (
 	"context"
 	"encoding/json"
+	"log/slog"
 	"net/http"
 	"strconv"
 	"strings"
 	"time"
 
+	"hostaggr/internal/middleware"
 	"hostaggr/internal/models"
+	"hostaggr/internal/obs"
 	"hostaggr/internal/search"
 )
 
 type Handler struct {
 	aggregator  *search.Aggregator
 	rateLimiter *search.RateLimiter
+	metrics     *obs.Metrics
+	logger      *slog.Logger
 }
 
-func NewHandler(agg *search.Aggregator, rl *search.RateLimiter) *Handler {
+func NewHandler(agg *search.Aggregator, rl *search.RateLimiter, m *obs.Metrics, logger *slog.Logger) *Handler {
 	return &Handler{
 		aggregator:  agg,
 		rateLimiter: rl,
+		metrics:     m,
+		logger:      logger,
 	}
 }
 
@@ -32,13 +39,17 @@ type healthResponse struct {
 	Status string `json:"status"`
 }
 
-// SearchHotels handles GET /search requests
 func (h *Handler) SearchHotels(w http.ResponseWriter, r *http.Request) {
-	// Extract IP address
+	requestID := middleware.GetRequestID(r.Context())
 	ip := extractIP(r)
 
-	// Check rate limit
 	if !h.rateLimiter.Allow(ip) {
+		if h.logger != nil {
+			h.logger.Warn("rate limit exceeded",
+				"request_id", requestID,
+				"ip", ip,
+			)
+		}
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusTooManyRequests)
 		json.NewEncoder(w).Encode(errorResponse{
@@ -47,7 +58,6 @@ func (h *Handler) SearchHotels(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Parse and validate query parameters
 	city := r.URL.Query().Get("city")
 	if city == "" {
 		w.Header().Set("Content-Type", "application/json")
@@ -68,7 +78,6 @@ func (h *Handler) SearchHotels(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Validate checkin format (YYYY-MM-DD)
 	if !isValidDateFormat(checkin) {
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusBadRequest)
@@ -118,7 +127,6 @@ func (h *Handler) SearchHotels(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Create search request
 	req := models.SearchRequest{
 		City:    city,
 		CheckIn: checkin,
@@ -126,13 +134,19 @@ func (h *Handler) SearchHotels(w http.ResponseWriter, r *http.Request) {
 		Adults:  adults,
 	}
 
-	// Create context with 5-second timeout
+	h.metrics.IncrementRequests()
+
 	ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
 	defer cancel()
 
-	// Perform search
 	response, err := h.aggregator.Search(ctx, req)
 	if err != nil {
+		if h.logger != nil {
+			h.logger.Error("search failed",
+				"request_id", requestID,
+				"error", err.Error(),
+			)
+		}
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusInternalServerError)
 		json.NewEncoder(w).Encode(errorResponse{
@@ -141,13 +155,17 @@ func (h *Handler) SearchHotels(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Return JSON response
+	if response.Stats.Cache == "hit" {
+		h.metrics.IncrementCacheHits()
+	} else {
+		h.metrics.IncrementCacheMisses()
+	}
+
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusOK)
 	json.NewEncoder(w).Encode(response)
 }
 
-// Health handles GET /healthz requests
 func (h *Handler) Health(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusOK)
@@ -156,29 +174,28 @@ func (h *Handler) Health(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-// Metrics handles GET /metrics requests
 func (h *Handler) Metrics(w http.ResponseWriter, r *http.Request) {
-	// Placeholder for metrics - will be implemented when obs.Metrics is created
-	metrics := map[string]interface{}{
-		"requests_total":  0,
-		"cache_hits":      0,
-		"cache_misses":    0,
-		"provider_errors": 0,
+	format := r.URL.Query().Get("format")
+	acceptHeader := r.Header.Get("Accept")
+
+	if format == "prometheus" || strings.Contains(acceptHeader, "text/plain") {
+		w.Header().Set("Content-Type", "text/plain; version=0.0.4; charset=utf-8")
+		w.WriteHeader(http.StatusOK)
+		w.Write([]byte(h.metrics.ToPrometheusFormat()))
+		return
 	}
 
+	snapshot := h.metrics.GetSnapshot()
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusOK)
-	json.NewEncoder(w).Encode(metrics)
+	json.NewEncoder(w).Encode(snapshot)
 }
 
 func extractIP(r *http.Request) string {
-	// Check X-Forwarded-For header first
 	ip := r.RemoteAddr
-	// RemoteAddr includes port, strip it
 	if idx := strings.LastIndex(ip, ":"); idx != -1 {
 		ip = ip[:idx]
 	}
-
 	return ip
 }
 
